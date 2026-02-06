@@ -10,7 +10,7 @@
  */
 
 import path from 'path';
-import { existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, statSync, openSync, closeSync, constants } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
@@ -55,6 +55,57 @@ function clearWorkerSpawnAttempted(): void {
   }
 }
 
+// Cross-process exclusive spawn lock to prevent concurrent worker spawns
+const SPAWN_LOCK_STALE_MS = 60_000; // 60 seconds
+
+function getSpawnLockPath(): string {
+  return path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), '.worker-spawn.lock');
+}
+
+/**
+ * Acquire an exclusive cross-process lock for worker spawning.
+ * Uses O_CREAT | O_EXCL which is atomic on all platforms — if the file
+ * already exists, openSync throws EEXIST and we know another process owns it.
+ *
+ * Returns a release function if lock acquired, or null if another process holds it.
+ * Includes a staleness check: if lock file is older than 60s, delete it and retry.
+ */
+function acquireSpawnLock(): (() => void) | null {
+  const lockPath = getSpawnLockPath();
+
+  // Staleness check: if lock is older than 60s, the owner likely crashed
+  try {
+    if (existsSync(lockPath)) {
+      const lockAge = Date.now() - statSync(lockPath).mtimeMs;
+      if (lockAge > SPAWN_LOCK_STALE_MS) {
+        logger.info('SYSTEM', 'Stale spawn lock detected, removing', { ageMs: lockAge });
+        unlinkSync(lockPath);
+      }
+    }
+  } catch {
+    // Race with another process — fine, continue to create attempt
+  }
+
+  try {
+    const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
+    // Write our PID for debugging
+    const buf = Buffer.from(JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
+    require('fs').writeSync(fd, buf);
+    closeSync(fd);
+
+    return () => {
+      try { unlinkSync(lockPath); } catch { /* Best-effort cleanup */ }
+    };
+  } catch (err: any) {
+    if (err.code === 'EEXIST') {
+      logger.info('SYSTEM', 'Another process holds spawn lock, skipping spawn');
+      return null;
+    }
+    logger.warn('SYSTEM', 'Unexpected error acquiring spawn lock', {}, err);
+    return null;
+  }
+}
+
 // Version injected at build time by esbuild define
 declare const __DEFAULT_PACKAGE_VERSION__: string;
 const packageVersion = typeof __DEFAULT_PACKAGE_VERSION__ !== 'undefined' ? __DEFAULT_PACKAGE_VERSION__ : '0.0.0-dev';
@@ -67,7 +118,9 @@ import {
   getPlatformTimeout,
   cleanupOrphanedProcesses,
   spawnDaemon,
-  createSignalHandler
+  createSignalHandler,
+  findProcessOnPort,
+  forceKillProcess
 } from './infrastructure/ProcessManager.js';
 import {
   isPortInUse,
@@ -533,8 +586,39 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
       logger.info('SYSTEM', 'Worker is now healthy');
       return true;
     }
-    logger.error('SYSTEM', 'Port in use but worker not responding to health checks');
-    return false;
+
+    // Port occupied but not responding — zombie process. Kill it and retry.
+    logger.warn('SYSTEM', 'Port in use but worker not responding — attempting zombie cleanup');
+    const zombiePid = await findProcessOnPort(port);
+    if (zombiePid && zombiePid > 0) {
+      logger.info('SYSTEM', 'Killing zombie process on port', { port, zombiePid });
+      await forceKillProcess(zombiePid);
+      const freed = await waitForPortFree(port, getPlatformTimeout(10000));
+      if (!freed) {
+        logger.error('SYSTEM', 'Port still occupied after killing zombie process', { port, zombiePid });
+        return false;
+      }
+      logger.info('SYSTEM', 'Zombie process killed, port freed', { port, zombiePid });
+      removePidFile();
+      // Fall through to spawn logic below
+    } else {
+      // Can't find who holds the port — try PID file as fallback
+      const pidInfo = readPidFile();
+      if (pidInfo && pidInfo.pid > 0) {
+        logger.info('SYSTEM', 'Killing process from PID file', { pid: pidInfo.pid });
+        await forceKillProcess(pidInfo.pid);
+        const freed = await waitForPortFree(port, getPlatformTimeout(10000));
+        if (!freed) {
+          logger.error('SYSTEM', 'Port still occupied after PID file kill', { port });
+          return false;
+        }
+        removePidFile();
+        // Fall through to spawn logic below
+      } else {
+        logger.error('SYSTEM', 'Cannot identify zombie process on port', { port });
+        return false;
+      }
+    }
   }
 
   // Windows: skip spawn if a recent attempt already failed (prevents repeated bun.exe popups, issue #921)
@@ -543,28 +627,47 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
     return false;
   }
 
-  // Spawn new worker daemon
-  logger.info('SYSTEM', 'Starting worker daemon');
-  markWorkerSpawnAttempted();
-  const pid = spawnDaemon(__filename, port);
-  if (pid === undefined) {
-    logger.error('SYSTEM', 'Failed to spawn worker daemon');
-    return false;
+  // Acquire exclusive spawn lock to prevent concurrent spawns from parallel hooks
+  const releaseLock = acquireSpawnLock();
+  if (!releaseLock) {
+    // Another process is already spawning — wait for it to finish
+    logger.info('SYSTEM', 'Waiting for another spawn attempt to complete');
+    const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+    return healthy;
   }
 
-  // PID file is written by the worker itself after listen() succeeds
-  // This is race-free and works correctly on Windows where cmd.exe PID is useless
+  try {
+    // Re-check after acquiring lock — another process may have started the worker
+    if (await waitForHealth(port, 1000)) {
+      logger.info('SYSTEM', 'Worker became healthy while acquiring lock');
+      return true;
+    }
 
-  const healthy = await waitForHealth(port, getPlatformTimeout(30000));
-  if (!healthy) {
-    removePidFile();
-    logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
-    return false;
+    // Spawn new worker daemon
+    logger.info('SYSTEM', 'Starting worker daemon');
+    markWorkerSpawnAttempted();
+    const pid = spawnDaemon(__filename, port);
+    if (pid === undefined) {
+      logger.error('SYSTEM', 'Failed to spawn worker daemon');
+      return false;
+    }
+
+    // PID file is written by the worker itself after listen() succeeds
+    // This is race-free and works correctly on Windows where cmd.exe PID is useless
+
+    const healthy = await waitForHealth(port, getPlatformTimeout(30000));
+    if (!healthy) {
+      removePidFile();
+      logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
+      return false;
+    }
+
+    clearWorkerSpawnAttempted();
+    logger.info('SYSTEM', 'Worker started successfully');
+    return true;
+  } finally {
+    releaseLock();
   }
-
-  clearWorkerSpawnAttempted();
-  logger.info('SYSTEM', 'Worker started successfully');
-  return true;
 }
 
 // ============================================================================
@@ -667,7 +770,6 @@ async function main() {
         logger.warn('SYSTEM', 'Worker failed to start before hook, handler will retry');
       }
 
-      // Existing logic unchanged
       const platform = process.argv[3];
       const event = process.argv[4];
       if (!platform || !event) {
@@ -677,23 +779,37 @@ async function main() {
         process.exit(1);
       }
 
-      // Check if worker is already running on port
-      const portInUse = await isPortInUse(port);
+      // Wait for worker to become healthy (daemon may still be binding port)
+      const portReady = await waitForHealth(port, 3000);
       let startedWorkerInProcess = false;
 
-      if (!portInUse) {
-        // Port free - start worker IN THIS PROCESS (no spawn!)
-        // This process becomes the worker and stays alive
-        try {
-          logger.info('SYSTEM', 'Starting worker in-process for hook', { event });
-          const worker = new WorkerService();
-          await worker.start();
-          startedWorkerInProcess = true;
-          // Worker is now running in this process on the port
-        } catch (error) {
-          logger.failure('SYSTEM', 'Worker failed to start in hook', {}, error as Error);
-          removePidFile();
-          process.exit(0);
+      if (!portReady) {
+        // Port still free — try in-process startup, but only if we can acquire the spawn lock
+        const releaseLock = acquireSpawnLock();
+        if (releaseLock) {
+          try {
+            // Re-check under lock — another process may have started the worker
+            if (!(await isPortInUse(port))) {
+              try {
+                logger.info('SYSTEM', 'Starting worker in-process for hook', { event });
+                const worker = new WorkerService();
+                await worker.start();
+                startedWorkerInProcess = true;
+              } catch (error) {
+                logger.failure('SYSTEM', 'Worker failed to start in hook', {}, error as Error);
+                removePidFile();
+                process.exit(0);
+              }
+            }
+          } finally {
+            releaseLock();
+          }
+        } else {
+          // Another process is spawning — wait for it
+          const healthy = await waitForHealth(port, getPlatformTimeout(15000));
+          if (!healthy) {
+            logger.warn('SYSTEM', 'Worker still not ready after waiting for spawn lock holder');
+          }
         }
       }
       // If port in use, we'll use HTTP to the existing worker

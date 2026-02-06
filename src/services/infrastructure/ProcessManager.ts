@@ -285,24 +285,36 @@ export function spawnDaemon(
   };
 
   if (isWindows) {
-    // Use WMIC to spawn a process that's independent of the parent console
-    // This avoids the console popup that occurs with detached: true
-    // Paths must be individually quoted for WMIC when they contain spaces
-    const execPath = process.execPath;
-    const script = scriptPath;
-    // WMIC command format: wmic process call create "\"path1\" \"path2\" args"
-    const command = `wmic process call create "\\"${execPath}\\" \\"${script}\\" --daemon"`;
+    // Try PowerShell Start-Process first (modern, returns real PID via -PassThru)
+    // Fall back to WMIC for older Windows versions where PowerShell may be restricted
+    const execPath = process.execPath.replace(/'/g, "''");
+    const script = scriptPath.replace(/'/g, "''");
 
     try {
-      execSync(command, {
-        stdio: 'ignore',
+      const psCommand = `powershell -NoProfile -NonInteractive -Command "$p = Start-Process -FilePath '${execPath}' -ArgumentList '${script}','--daemon' -WindowStyle Hidden -PassThru; Write-Output $p.Id"`;
+      const result = execSync(psCommand, {
+        encoding: 'utf-8',
+        timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND,
         windowsHide: true
       });
-      // WMIC returns immediately, we can't get the spawned PID easily
-      // Worker will write its own PID file after listen()
+
+      const pid = parseInt(result.trim(), 10);
+      if (pid > 0) {
+        logger.info('SYSTEM', 'Spawned daemon via PowerShell', { pid });
+        return pid;
+      }
+      // PowerShell succeeded but no valid PID — worker will self-register
       return 0;
     } catch {
-      return undefined;
+      // PowerShell failed — fall back to WMIC
+      logger.debug('SYSTEM', 'PowerShell spawn failed, falling back to WMIC');
+      const wmicCommand = `wmic process call create "\\"${process.execPath}\\" \\"${scriptPath}\\" --daemon"`;
+      try {
+        execSync(wmicCommand, { stdio: 'ignore', windowsHide: true });
+        return 0;
+      } catch {
+        return undefined;
+      }
     }
   }
 
@@ -320,6 +332,44 @@ export function spawnDaemon(
   child.unref();
 
   return child.pid;
+}
+
+/**
+ * Find which process (PID) is listening on a specific port.
+ * Windows: Uses netstat -ano to find the LISTENING process.
+ * Unix: Uses lsof to find the process.
+ * Returns null if no process found or command fails.
+ */
+export async function findProcessOnPort(port: number): Promise<number | null> {
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execAsync(`netstat -ano | findstr :${port}`, {
+        timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND
+      });
+
+      if (!stdout.trim()) return null;
+
+      for (const line of stdout.trim().split('\n')) {
+        if (line.includes('LISTENING')) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parseInt(parts[parts.length - 1], 10);
+          if (pid > 0) {
+            logger.debug('SYSTEM', 'Found process on port', { port, pid });
+            return pid;
+          }
+        }
+      }
+      return null;
+    } else {
+      const { stdout } = await execAsync(`lsof -ti:${port}`, {
+        timeout: HOOK_TIMEOUTS.POWERSHELL_COMMAND
+      });
+      const pid = parseInt(stdout.trim(), 10);
+      return pid > 0 ? pid : null;
+    }
+  } catch {
+    return null;
+  }
 }
 
 /**
