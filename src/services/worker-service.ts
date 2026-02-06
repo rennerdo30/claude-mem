@@ -10,7 +10,7 @@
  */
 
 import path from 'path';
-import { existsSync, writeFileSync, unlinkSync, statSync, openSync, closeSync, constants } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, statSync, openSync, closeSync, constants, mkdirSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
@@ -87,6 +87,8 @@ function acquireSpawnLock(): (() => void) | null {
   }
 
   try {
+    // Ensure data directory exists (may not on first run)
+    mkdirSync(path.dirname(lockPath), { recursive: true });
     const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
     // Write our PID for debugging
     const buf = Buffer.from(JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
