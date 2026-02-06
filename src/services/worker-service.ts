@@ -624,6 +624,24 @@ async function ensureWorkerStarted(port: number): Promise<boolean> {
     }
   }
 
+  // OS-level port check: HTTP health checks can fail transiently (Bun fetch quirks,
+  // worker briefly busy). Before spawning, verify the port is actually free at the OS level.
+  // If a process IS listening but the health check failed, wait for it rather than spawning.
+  const processOnPort = await findProcessOnPort(port);
+  if (processOnPort) {
+    logger.info('SYSTEM', 'Port occupied at OS level but health check failed, waiting', { port, pid: processOnPort });
+    const healthy = await waitForHealth(port, getPlatformTimeout(15000));
+    if (healthy) {
+      logger.info('SYSTEM', 'Worker became healthy after OS-level port check');
+      return true;
+    }
+    // Still not healthy — treat as zombie and kill it
+    logger.warn('SYSTEM', 'Process on port still unhealthy, killing', { port, pid: processOnPort });
+    await forceKillProcess(processOnPort);
+    await waitForPortFree(port, getPlatformTimeout(10000));
+    removePidFile();
+  }
+
   // Windows: skip spawn if a recent attempt already failed (prevents repeated bun.exe popups, issue #921)
   if (shouldSkipSpawnOnWindows()) {
     logger.warn('SYSTEM', 'Worker unavailable on Windows — skipping spawn (recent attempt failed within cooldown)');
