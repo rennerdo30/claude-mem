@@ -9,6 +9,11 @@
  * - src/services/worker/ - Business logic, routes, agents
  */
 
+// Ensure localhost health checks bypass HTTP proxy (common issue on corporate Windows machines)
+if (!process.env.NO_PROXY || !process.env.NO_PROXY.includes('127.0.0.1')) {
+  process.env.NO_PROXY = [process.env.NO_PROXY, '127.0.0.1', 'localhost'].filter(Boolean).join(',');
+}
+
 import path from 'path';
 import { existsSync, writeFileSync, unlinkSync, statSync, mkdirSync, rmdirSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
