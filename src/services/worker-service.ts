@@ -10,7 +10,7 @@
  */
 
 import path from 'path';
-import { existsSync, writeFileSync, unlinkSync, statSync, openSync, closeSync, constants, mkdirSync } from 'fs';
+import { existsSync, writeFileSync, unlinkSync, statSync, mkdirSync, rmdirSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
@@ -64,11 +64,15 @@ function getSpawnLockPath(): string {
 
 /**
  * Acquire an exclusive cross-process lock for worker spawning.
- * Uses O_CREAT | O_EXCL which is atomic on all platforms — if the file
- * already exists, openSync throws EEXIST and we know another process owns it.
+ * Uses mkdirSync (without recursive) which is atomic on all platforms — if the
+ * directory already exists, it throws EEXIST and we know another process owns it.
+ *
+ * Note: openSync with O_CREAT|O_EXCL would be the natural choice, but Bun has a
+ * known bug on Windows where it throws ENOENT instead (oven-sh/bun#11873).
+ * mkdir-based locking works correctly in both Bun and Node.js.
  *
  * Returns a release function if lock acquired, or null if another process holds it.
- * Includes a staleness check: if lock file is older than 60s, delete it and retry.
+ * Includes a staleness check: if lock dir is older than 60s, delete it and retry.
  */
 function acquireSpawnLock(): (() => void) | null {
   const lockPath = getSpawnLockPath();
@@ -79,7 +83,7 @@ function acquireSpawnLock(): (() => void) | null {
       const lockAge = Date.now() - statSync(lockPath).mtimeMs;
       if (lockAge > SPAWN_LOCK_STALE_MS) {
         logger.info('SYSTEM', 'Stale spawn lock detected, removing', { ageMs: lockAge });
-        unlinkSync(lockPath);
+        rmdirSync(lockPath);
       }
     }
   } catch {
@@ -87,16 +91,13 @@ function acquireSpawnLock(): (() => void) | null {
   }
 
   try {
-    // Ensure data directory exists (may not on first run)
+    // Ensure parent data directory exists (may not on first run)
     mkdirSync(path.dirname(lockPath), { recursive: true });
-    const fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR);
-    // Write our PID for debugging
-    const buf = Buffer.from(JSON.stringify({ pid: process.pid, timestamp: Date.now() }));
-    require('fs').writeSync(fd, buf);
-    closeSync(fd);
+    // Atomic lock: mkdirSync without recursive throws EEXIST if dir exists
+    mkdirSync(lockPath);
 
     return () => {
-      try { unlinkSync(lockPath); } catch { /* Best-effort cleanup */ }
+      try { rmdirSync(lockPath); } catch { /* Best-effort cleanup */ }
     };
   } catch (err: any) {
     if (err.code === 'EEXIST') {
